@@ -1,0 +1,35 @@
+name: Hourly Feature Pipeline
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-feature-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests python-dotenv pandas "hopsworks[python]"
+
+      - name: Run feature pipeline
+        env:
+          AQICN_API_TOKEN: ${{ secrets.AQICN_API_TOKEN }}
+          CITY: ${{ secrets.CITY }}
+          CITY_LAT: ${{ secrets.CITY_LAT }}
+          CITY_LON: ${{ secrets.CITY_LON }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+        run: |
+          python pipelines/feature_pipeline.py
