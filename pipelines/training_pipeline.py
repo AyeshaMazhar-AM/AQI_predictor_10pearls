@@ -91,7 +91,13 @@ def evaluate(y_true, y_pred) -> dict:
 def train_horizon(df: pd.DataFrame, target_col: str) -> dict:
     """Trains Ridge + Random Forest (+ a small NN if TensorFlow is available)
     for one forecast horizon, and returns the best model + its metrics."""
-    data = df.dropna(subset=FEATURE_COLUMNS + [target_col]).reset_index(drop=True)
+    # Only require the target itself to be present. For feature columns,
+    # impute missing values with the column median rather than dropping
+    # the row entirely — some pollutants (e.g. pm10, o3) aren't reported
+    # by every station/reading, and dropping those rows wastes a lot of
+    # otherwise-usable data.
+    data = df.dropna(subset=[target_col]).reset_index(drop=True)
+    data[FEATURE_COLUMNS] = data[FEATURE_COLUMNS].fillna(data[FEATURE_COLUMNS].median(numeric_only=True))
 
     if len(data) < 50:
         raise ValueError(

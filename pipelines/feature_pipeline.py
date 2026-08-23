@@ -24,28 +24,33 @@ import config
 # 1. RAW DATA FETCHING
 # ---------------------------------------------------------------------------
 
-def fetch_aqicn_data(city: str, token: str) -> dict:
-    """Fetch current AQI + pollutant readings for a city from AQICN."""
-    url = f"https://api.waqi.info/feed/{city}/?token={token}"
+def fetch_current_air_quality(lat: float, lon: float) -> dict:
+    """Fetch current AQI + pollutant readings from Open-Meteo's Air Quality
+    API. Used instead of AQICN's live feed because individual AQICN ground
+    stations can go stale or silently stop reporting (discovered during
+    testing: the 'karachi' station had been frozen since March 2025), while
+    Open-Meteo's model-based estimate is always current and matches the
+    same source used for historical backfill — keeping methodology
+    consistent across live and historical data."""
+    url = (
+        "https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,us_aqi"
+    )
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
-    payload = resp.json()
-
-    if payload.get("status") != "ok":
-        raise ValueError(f"AQICN API error: {payload}")
-
-    data = payload["data"]
-    iaqi = data.get("iaqi", {})
+    data = resp.json()
+    current = data.get("current", {})
 
     return {
-        "aqi": data.get("aqi"),
-        "pm25": iaqi.get("pm25", {}).get("v"),
-        "pm10": iaqi.get("pm10", {}).get("v"),
-        "o3": iaqi.get("o3", {}).get("v"),
-        "no2": iaqi.get("no2", {}).get("v"),
-        "so2": iaqi.get("so2", {}).get("v"),
-        "co": iaqi.get("co", {}).get("v"),
-        "station_time": data.get("time", {}).get("iso"),
+        "aqi": current.get("us_aqi"),
+        "pm25": current.get("pm2_5"),
+        "pm10": current.get("pm10"),
+        "o3": current.get("ozone"),
+        "no2": current.get("nitrogen_dioxide"),
+        "so2": current.get("sulphur_dioxide"),
+        "co": current.get("carbon_monoxide"),
+        "station_time": current.get("time"),
     }
 
 
@@ -180,8 +185,8 @@ def push_to_feature_store(row: dict):
 def run(push_to_hopsworks: bool = True) -> dict:
     config.validate_config()
 
-    print(f"[1/4] Fetching AQICN data for '{config.CITY}'...")
-    raw_aqi = fetch_aqicn_data(config.CITY, config.AQICN_API_TOKEN)
+    print(f"[1/4] Fetching current air quality for '{config.CITY}'...")
+    raw_aqi = fetch_current_air_quality(config.CITY_LAT, config.CITY_LON)
 
     print("[2/4] Fetching weather data...")
     raw_weather = fetch_weather_data(config.CITY_LAT, config.CITY_LON)

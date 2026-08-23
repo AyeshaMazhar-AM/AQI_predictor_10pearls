@@ -25,8 +25,8 @@ FEATURE_GROUP_VERSION = 1
 # --- Sanity check helper ---
 def validate_config():
     missing = []
-    if not AQICN_API_TOKEN or AQICN_API_TOKEN == "your_aqicn_token_here":
-        missing.append("AQICN_API_TOKEN")
+    if not HOPSWORKS_API_KEY or HOPSWORKS_API_KEY == "your_hopsworks_key_here":
+        missing.append("HOPSWORKS_API_KEY")
     if missing:
         raise EnvironmentError(
             f"Missing required environment variables: {missing}. "

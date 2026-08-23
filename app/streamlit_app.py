@@ -84,7 +84,6 @@ def load_model(horizon: str):
     """Downloads the saved model + metadata for a given horizon from the
     Hopsworks Model Registry and loads it into memory."""
     import json
-    import tensorflow as tf  # only imported if a neural net model exists
 
     project = get_hopsworks_project()
     mr = project.get_model_registry()
@@ -95,6 +94,7 @@ def load_model(horizon: str):
         metadata = json.load(f)
 
     if metadata["algorithm"] == "neural_net":
+        import tensorflow as tf  # only needed for this algorithm
         model = tf.keras.models.load_model(os.path.join(model_dir, "model.keras"))
         scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
     else:
@@ -104,11 +104,16 @@ def load_model(horizon: str):
     return {"model": model, "scaler": scaler, "metadata": metadata}
 
 
-def predict(bundle: dict, latest_row: pd.DataFrame) -> float:
-    X = latest_row[FEATURE_COLUMNS]
-    if bundle["scaler"] is not None:
-        X = bundle["scaler"].transform(X)
-        pred = bundle["model"].predict(X, verbose=0).flatten()[0]
+def predict(bundle: dict, latest_row: pd.DataFrame, fill_values: pd.Series) -> float:
+    X = latest_row[FEATURE_COLUMNS].copy()
+    # The live AQICN feed for this city doesn't report every pollutant
+    # (pm10/o3/no2/so2/co often come back empty), but the models were
+    # trained on rows that had all of them. Fill any gaps with recent
+    # historical medians so prediction doesn't fail on missing values.
+    X = X.fillna(fill_values)
+    if bundle["metadata"]["algorithm"] == "neural_net":
+        X_scaled = bundle["scaler"].transform(X)
+        pred = bundle["model"].predict(X_scaled, verbose=0).flatten()[0]
     else:
         pred = bundle["model"].predict(X)[0]
     return float(pred)
@@ -152,10 +157,11 @@ st.subheader("3-Day Forecast")
 
 forecast_rows = []
 load_errors = []
+fill_values = history[FEATURE_COLUMNS].median(numeric_only=True)
 for h in HORIZONS:
     try:
         bundle = load_model(h)
-        pred_value = predict(bundle, latest)
+        pred_value = predict(bundle, latest, fill_values)
         hours = int(h.replace("h", ""))
         forecast_rows.append({
             "horizon": h,
