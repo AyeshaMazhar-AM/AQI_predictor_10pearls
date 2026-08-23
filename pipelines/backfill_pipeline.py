@@ -1,126 +1,131 @@
 """
-Backfill Pipeline
-==================
-Bootstraps historical training data from a downloaded CSV file, applies the
-SAME feature engineering as feature_pipeline.py, and bulk-inserts everything
-into the same Hopsworks feature group. This lets your training pipeline have
-weeks/months of data on day one, while feature_pipeline.py keeps adding real
-live rows on top of it every hour going forward.
+Backfill Pipeline (v2 — Open-Meteo historical archive)
+========================================================
+Bootstraps historical training data automatically by calling Open-Meteo's
+free historical Air Quality + Weather archive APIs for your city's exact
+coordinates. No manual CSV download, no Kaggle hunting, no column mapping.
 
-WHERE TO GET A HISTORICAL CSV (pick one):
-------------------------------------------
-1. AQICN's own historical data platform (best fit, matches your API):
-   https://aqicn.org/data-platform/register/
-   -> free registration -> download historical CSV for your city's station
+Data sources (both free, no API key required):
+- Air quality history: https://air-quality-api.open-meteo.com/v1/air-quality
+  (PM2.5, PM10, NO2, SO2, CO, ozone, and a computed AQI — CAMS reanalysis
+  model estimates, not raw ground-station readings, but a solid proxy for
+  training when real station history isn't available for free)
+- Weather history: https://archive-api.open-meteo.com/v1/archive
+  (temperature, humidity, wind, pressure)
 
-2. Kaggle - search "Air Quality Index" or "<your city> air quality dataset"
-   e.g. https://www.kaggle.com/datasets?search=air+quality
-
-3. OpenAQ (openaq.org) - free historical air quality data via API, covers
-   many cities globally, good fallback if #1/#2 don't have your city.
-
-HOW TO USE THIS SCRIPT:
-------------------------
-1. Download a CSV from one of the sources above into data/historical_raw.csv
-2. Open the COLUMN_MAPPING section below and map YOUR file's column names
-   to our standard names (left side = our name, right side = your CSV's
-   column name). Delete/comment out any you don't have.
-3. Run: python pipelines/backfill_pipeline.py
+Run:
+    python pipelines/backfill_pipeline.py
 """
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import requests
 import pandas as pd
-import numpy as np
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 
 
-# ---------------------------------------------------------------------------
-# CONFIGURE THIS FOR YOUR DOWNLOADED CSV
-# ---------------------------------------------------------------------------
-
-RAW_CSV_PATH = "data/historical_raw.csv"   # <-- change to your downloaded file
-
-# Map OUR standard feature names -> the column name in YOUR csv.
-# Set any value to None if that column doesn't exist in your file — the
-# script will fill it with NaN and still work (models handle missing values).
-COLUMN_MAPPING = {
-    "datetime": "date",       # REQUIRED — any column with a parseable date/time
-    "aqi":      "aqi",        # REQUIRED — the target variable
-    "pm25":     "pm25",
-    "pm10":     "pm10",
-    "o3":       "o3",
-    "no2":      "no2",
-    "so2":      "so2",
-    "co":       "co",
-    "temp":     None,         # e.g. "temperature" if your file has it
-    "humidity": None,
-    "wind_speed": None,
-    "pressure": None,
-}
+# How many past days to backfill. Open-Meteo's air quality archive
+# generally covers a good multi-year window, but start smaller (e.g. 60
+# days) to keep the first run fast — you can re-run with a bigger range
+# later once everything works.
+BACKFILL_DAYS = 60
 
 
 # ---------------------------------------------------------------------------
-# 1. LOAD + CLEAN RAW CSV
+# 1. FETCH HISTORICAL AIR QUALITY
 # ---------------------------------------------------------------------------
 
-def load_and_clean(csv_path: str, mapping: dict) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+def fetch_historical_air_quality(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch hourly historical pollutant + AQI data from Open-Meteo."""
+    url = (
+        "https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat}&longitude={lon}"
+        f"&start_date={start_date}&end_date={end_date}"
+        "&hourly=pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,us_aqi"
+        "&timezone=UTC"
+    )
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
 
-    if mapping["datetime"] not in df.columns:
-        raise ValueError(
-            f"Datetime column '{mapping['datetime']}' not found in CSV. "
-            f"Available columns: {list(df.columns)}"
-        )
-    if mapping["aqi"] not in df.columns:
-        raise ValueError(
-            f"AQI column '{mapping['aqi']}' not found in CSV. "
-            f"Available columns: {list(df.columns)}"
-        )
+    if "hourly" not in data:
+        raise ValueError(f"Unexpected air quality response: {data}")
 
-    out = pd.DataFrame()
-    out["timestamp"] = pd.to_datetime(df[mapping["datetime"]], errors="coerce", utc=True)
-
-    for feature_name, col_name in mapping.items():
-        if feature_name == "datetime":
-            continue
-        if col_name is not None and col_name in df.columns:
-            out[feature_name] = pd.to_numeric(df[col_name], errors="coerce")
-        else:
-            out[feature_name] = np.nan
-
-    # Drop rows with no timestamp or no AQI — useless for training
-    out = out.dropna(subset=["timestamp", "aqi"])
-    out = out.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
-
-    print(f"[OK] Loaded {len(out)} valid historical rows "
-          f"({out['timestamp'].min()} -> {out['timestamp'].max()})")
-    return out
+    hourly = data["hourly"]
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(hourly["time"], utc=True),
+        "aqi": hourly.get("us_aqi"),
+        "pm25": hourly.get("pm2_5"),
+        "pm10": hourly.get("pm10"),
+        "co": hourly.get("carbon_monoxide"),
+        "no2": hourly.get("nitrogen_dioxide"),
+        "so2": hourly.get("sulphur_dioxide"),
+        "o3": hourly.get("ozone"),
+    })
+    return df
 
 
 # ---------------------------------------------------------------------------
-# 2. FEATURE ENGINEERING (mirrors feature_pipeline.py exactly)
+# 2. FETCH HISTORICAL WEATHER
+# ---------------------------------------------------------------------------
+
+def fetch_historical_weather(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch hourly historical weather data from Open-Meteo."""
+    url = (
+        "https://archive-api.open-meteo.com/v1/archive"
+        f"?latitude={lat}&longitude={lon}"
+        f"&start_date={start_date}&end_date={end_date}"
+        "&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,pressure_msl"
+        "&timezone=UTC"
+    )
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "hourly" not in data:
+        raise ValueError(f"Unexpected weather response: {data}")
+
+    hourly = data["hourly"]
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(hourly["time"], utc=True),
+        "temp": hourly.get("temperature_2m"),
+        "humidity": hourly.get("relative_humidity_2m"),
+        "wind_speed": hourly.get("wind_speed_10m"),
+        "pressure": hourly.get("pressure_msl"),
+    })
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 3. FEATURE ENGINEERING (mirrors feature_pipeline.py exactly)
 # ---------------------------------------------------------------------------
 
 def engineer_features_batch(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
     df["unix_time"] = df["timestamp"].astype("int64") // 10**9
     df["city"] = config.CITY
 
-    df["hour"] = df["timestamp"].dt.hour
-    df["day_of_week"] = df["timestamp"].dt.dayofweek
-    df["day_of_month"] = df["timestamp"].dt.day
-    df["month"] = df["timestamp"].dt.month
-    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+    df["hour"] = df["timestamp"].dt.hour.astype("int64")
+    df["day_of_week"] = df["timestamp"].dt.dayofweek.astype("int64")
+    df["day_of_month"] = df["timestamp"].dt.day.astype("int64")
+    df["month"] = df["timestamp"].dt.month.astype("int64")
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype("int64")
 
-    # AQI change rate vs the previous chronological row
     df["aqi_change_rate"] = df["aqi"].diff().fillna(0.0)
 
-    # Column order matching the live feature group schema
+    numeric_cols = [
+        "aqi", "pm25", "pm10", "o3", "no2", "so2", "co",
+        "temp", "humidity", "wind_speed", "pressure",
+        "aqi_change_rate",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+
     ordered_cols = [
         "timestamp", "unix_time", "city",
         "aqi", "pm25", "pm10", "o3", "no2", "so2", "co",
@@ -132,7 +137,7 @@ def engineer_features_batch(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3. BULK PUSH TO HOPSWORKS
+# 4. BULK PUSH TO HOPSWORKS
 # ---------------------------------------------------------------------------
 
 def push_batch_to_feature_store(df: pd.DataFrame, batch_size: int = 5000):
@@ -151,6 +156,7 @@ def push_batch_to_feature_store(df: pd.DataFrame, batch_size: int = 5000):
         primary_key=["city", "unix_time"],
         event_time="timestamp",
         online_enabled=True,
+        time_travel_format="HUDI",
     )
 
     total = len(df)
@@ -159,30 +165,42 @@ def push_batch_to_feature_store(df: pd.DataFrame, batch_size: int = 5000):
         fg.insert(chunk, write_options={"wait_for_job": False})
         print(f"[OK] Inserted rows {start} -> {start + len(chunk)} of {total}")
 
-    print(f"[DONE] Backfilled {total} historical rows into "
-          f"'{config.FEATURE_GROUP_NAME}'.")
+    print(f"[DONE] Backfilled {total} historical rows into '{config.FEATURE_GROUP_NAME}'.")
 
 
 # ---------------------------------------------------------------------------
-# 4. MAIN
+# 5. MAIN
 # ---------------------------------------------------------------------------
 
-def run(push_to_hopsworks: bool = True):
+def run(push_to_hopsworks: bool = True, days: int = BACKFILL_DAYS):
     config.validate_config()
 
-    print(f"[1/3] Loading raw CSV from '{RAW_CSV_PATH}'...")
-    raw_df = load_and_clean(RAW_CSV_PATH, COLUMN_MAPPING)
+    end_date = datetime.now(timezone.utc).date() - timedelta(days=1)  # yesterday (today may be incomplete)
+    start_date = end_date - timedelta(days=days)
+    start_str, end_str = start_date.isoformat(), end_date.isoformat()
 
-    print("[2/3] Engineering features for all historical rows...")
-    features_df = engineer_features_batch(raw_df)
+    print(f"[1/4] Fetching historical air quality for '{config.CITY}' "
+          f"({start_str} -> {end_str})...")
+    aq_df = fetch_historical_air_quality(config.CITY_LAT, config.CITY_LON, start_str, end_str)
+    print(f"       -> {len(aq_df)} hourly rows fetched")
+
+    print("[2/4] Fetching historical weather...")
+    weather_df = fetch_historical_weather(config.CITY_LAT, config.CITY_LON, start_str, end_str)
+    print(f"       -> {len(weather_df)} hourly rows fetched")
+
+    print("[3/4] Merging + engineering features...")
+    merged = pd.merge(aq_df, weather_df, on="timestamp", how="inner")
+    merged = merged.dropna(subset=["aqi"])  # drop hours with no AQI reading
+    features_df = engineer_features_batch(merged)
     print(features_df.head())
+    print(f"       -> {len(features_df)} total feature rows ready")
 
     if push_to_hopsworks:
-        print("[3/3] Pushing batch to Hopsworks Feature Store...")
+        print("[4/4] Pushing batch to Hopsworks Feature Store...")
         push_batch_to_feature_store(features_df)
     else:
-        print("[3/3] Skipped Hopsworks push (dry run only). "
-              f"Would have inserted {len(features_df)} rows.")
+        print("[4/4] Skipped Hopsworks push (dry run only).")
+        os.makedirs("data", exist_ok=True)
         features_df.to_csv("data/backfill_preview.csv", index=False)
         print("Saved preview to data/backfill_preview.csv for inspection.")
 
@@ -190,6 +208,5 @@ def run(push_to_hopsworks: bool = True):
 
 
 if __name__ == "__main__":
-    # Do a dry run FIRST to sanity-check the engineered features before
-    # writing thousands of rows to Hopsworks.
-    run(push_to_hopsworks=False)
+    # Dry run first — sanity check the data before writing to Hopsworks.
+    run(push_to_hopsworks=True)

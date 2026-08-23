@@ -1,0 +1,28 @@
+{
+  "algorithm": "ridge",
+  "horizon": "48h",
+  "feature_columns": [
+    "aqi",
+    "pm25",
+    "pm10",
+    "o3",
+    "no2",
+    "so2",
+    "co",
+    "temp",
+    "humidity",
+    "wind_speed",
+    "pressure",
+    "hour",
+    "day_of_week",
+    "day_of_month",
+    "month",
+    "is_weekend",
+    "aqi_change_rate"
+  ],
+  "metrics": {
+    "rmse": 5.349431522688398,
+    "mae": 3.5306458109839225,
+    "r2": 0.06406020155048175
+  }
+}
