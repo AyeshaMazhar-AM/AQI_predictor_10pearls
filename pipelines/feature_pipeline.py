@@ -101,10 +101,10 @@ def engineer_features(raw_aqi: dict, raw_weather: dict, previous_aqi: float = No
         "pressure": raw_weather["pressure"],
 
         # Time-based features
-        "hour": now.hour,
-        "day_of_week": now.weekday(),          # 0=Monday
-        "day_of_month": now.day,
-        "month": now.month,
+        "hour": int(now.hour),
+        "day_of_week": int(now.weekday()),          # 0=Monday
+        "day_of_month": int(now.day),
+        "month": int(now.month),
         "is_weekend": int(now.weekday() >= 5),
     }
 
@@ -169,7 +169,7 @@ def push_to_feature_store(row: dict):
         online_enabled=True,
         time_travel_format="HUDI",
     )
-    fg.insert(df, write_options={"wait_for_job": True})
+    fg.insert(df, write_options={"wait_for_job": False})
     print(f"[OK] Inserted 1 row into '{config.FEATURE_GROUP_NAME}' feature group.")
 
 
