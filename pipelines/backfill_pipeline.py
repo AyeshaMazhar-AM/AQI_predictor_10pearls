@@ -31,7 +31,7 @@ import config
 # generally covers a good multi-year window, but start smaller (e.g. 60
 # days) to keep the first run fast — you can re-run with a bigger range
 # later once everything works.
-BACKFILL_DAYS = 60
+BACKFILL_DAYS = 365
 
 
 # ---------------------------------------------------------------------------

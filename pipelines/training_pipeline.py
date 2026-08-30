@@ -18,8 +18,11 @@ import json
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import RidgeCV
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 import config
@@ -51,6 +54,17 @@ def fetch_training_data() -> pd.DataFrame:
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+
+    # Filter out rows from the period when the AQICN 'karachi' station was
+    # discovered to be dead (frozen since March 2025), which repeatedly
+    # returned the exact same aqi=161, pm25=161 during live testing. These
+    # are testing artifacts, not genuine readings, and would bias the model.
+    before = len(df)
+    df = df[~((df["aqi"] == 161) & (df["pm25"] == 161))].reset_index(drop=True)
+    removed = before - len(df)
+    if removed:
+        print(f"       [cleanup] Removed {removed} stale/duplicate test rows (aqi=161, pm25=161)")
+
     return df
 
 
@@ -114,26 +128,71 @@ def train_horizon(df: pd.DataFrame, target_col: str) -> dict:
 
     results = {}
 
-    # --- Ridge Regression baseline ---
-    ridge = Ridge(alpha=1.0)
+    # --- Ridge Regression baseline, now scaled + auto-tuned alpha ---
+    # Scaling matters for Ridge: features like 'co' range in the hundreds
+    # while 'is_weekend' is 0/1 — without scaling, the regularization
+    # penalty affects them very unevenly. RidgeCV also tries multiple
+    # alpha (regularization strength) values internally via time-aware
+    # cross-validation and keeps the best one automatically.
+    tscv = TimeSeriesSplit(n_splits=3)
+    ridge = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge", RidgeCV(alphas=np.logspace(-2, 3, 12), cv=tscv)),
+    ])
     ridge.fit(X_train, y_train)
     results["ridge"] = {
         "model": ridge,
         "metrics": evaluate(y_test, ridge.predict(X_test)),
     }
 
-    # --- Random Forest ---
-    rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
-    rf.fit(X_train, y_train)
+    # --- Random Forest, hyperparameter-tuned via randomized search ---
+    # Fixed hyperparameters were likely under/over-fitting depending on
+    # horizon; search a reasonable space with time-aware cross-validation
+    # instead of guessing one fixed configuration.
+    rf_param_dist = {
+        "n_estimators": [100, 200, 300, 400],
+        "max_depth": [4, 6, 8, 10, 14, None],
+        "min_samples_leaf": [1, 2, 4, 8],
+        "max_features": ["sqrt", "log2", 0.5, 0.8],
+    }
+    rf_search = RandomizedSearchCV(
+        RandomForestRegressor(random_state=42, n_jobs=-1),
+        param_distributions=rf_param_dist,
+        n_iter=15, cv=tscv, scoring="neg_root_mean_squared_error",
+        random_state=42, n_jobs=-1,
+    )
+    rf_search.fit(X_train, y_train)
+    rf = rf_search.best_estimator_
     results["random_forest"] = {
         "model": rf,
         "metrics": evaluate(y_test, rf.predict(X_test)),
+    }
+    print(f"       [tuned] random_forest best params: {rf_search.best_params_}")
+
+    # --- Histogram-based Gradient Boosting, also tuned ---
+    hgb_param_dist = {
+        "max_depth": [3, 4, 5, 6, 8],
+        "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+        "max_iter": [100, 200, 300, 400],
+        "min_samples_leaf": [5, 10, 20, 30],
+        "l2_regularization": [0.0, 0.1, 0.5, 1.0],
+    }
+    hgb_search = RandomizedSearchCV(
+        HistGradientBoostingRegressor(random_state=42),
+        param_distributions=hgb_param_dist,
+        n_iter=15, cv=tscv, scoring="neg_root_mean_squared_error",
+        random_state=42, n_jobs=-1,
+    )
+    hgb_search.fit(X_train, y_train)
+    hgb = hgb_search.best_estimator_
+    results["hist_gradient_boosting"] = {
+        "model": hgb,
+        "metrics": evaluate(y_test, hgb.predict(X_test)),
     }
 
     # --- Optional: small neural network (TensorFlow), if installed ---
     try:
         import tensorflow as tf
-        from sklearn.preprocessing import StandardScaler
 
         scaler = StandardScaler()
         X_train_s = scaler.fit_transform(X_train)
@@ -217,7 +276,26 @@ def save_to_registry(horizon_label: str, result: dict):
         metrics=metrics,
         description=f"AQI forecast model, {horizon_label} horizon, algorithm={result['best_name']}",
     )
-    hw_model.save(model_dir)
+    # Hopsworks' upload endpoint occasionally drops the connection
+    # mid-request (transient server-side issue, seen intermittently
+    # throughout this project on both reads and writes) — retry a few
+    # times with a short backoff instead of failing the whole run over
+    # a one-off network blip.
+    import time
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            hw_model.save(model_dir)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            wait = 10 * attempt
+            print(f"       [retry {attempt}/3] Upload failed ({e.__class__.__name__}), "
+                  f"retrying in {wait}s...")
+            time.sleep(wait)
+    if last_error is not None:
+        raise last_error
     print(f"       [OK] Saved '{model_name}' ({result['best_name']}) to Model Registry.")
 
 
@@ -243,7 +321,14 @@ def run(push_to_registry: bool = True):
         summary[label] = result
 
         if push_to_registry:
-            save_to_registry(label, result)
+            try:
+                save_to_registry(label, result)
+            except Exception as e:
+                # Don't let a save failure on one horizon (e.g. a
+                # persistent Hopsworks outage) prevent the other horizons
+                # from training and saving successfully.
+                print(f"       [FAILED] Could not save '{label}' to registry "
+                      f"after retries: {e}. Continuing with remaining horizons.")
 
     print("\n=== SUMMARY (best model per horizon) ===")
     for label, result in summary.items():

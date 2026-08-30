@@ -87,7 +87,13 @@ def load_model(horizon: str):
 
     project = get_hopsworks_project()
     mr = project.get_model_registry()
-    model_obj = mr.get_model(f"aqi_model_{horizon}")
+
+    # Always use the newest (highest-numbered) version, not whatever
+    # Hopsworks defaults to (version 1) — otherwise the dashboard silently
+    # keeps serving your very first, worst training run forever.
+    all_versions = mr.get_models(name=f"aqi_model_{horizon}")
+    latest_version = max(m.version for m in all_versions)
+    model_obj = mr.get_model(f"aqi_model_{horizon}", version=latest_version)
     model_dir = model_obj.download()
 
     with open(os.path.join(model_dir, "metadata.json")) as f:
@@ -116,7 +122,9 @@ def predict(bundle: dict, latest_row: pd.DataFrame, fill_values: pd.Series) -> f
         pred = bundle["model"].predict(X_scaled, verbose=0).flatten()[0]
     else:
         pred = bundle["model"].predict(X)[0]
-    return float(pred)
+    # AQI is physically bounded [0, 500] — Ridge/linear models can
+    # extrapolate outside real-world limits on unusual inputs, so clamp.
+    return float(np.clip(pred, 0, 500))
 
 
 # ---------------------------------------------------------------------------

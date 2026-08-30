@@ -1,5 +1,5 @@
 {
-  "algorithm": "ridge",
+  "algorithm": "random_forest",
   "horizon": "72h",
   "feature_columns": [
     "aqi",
@@ -21,8 +21,8 @@
     "aqi_change_rate"
   ],
   "metrics": {
-    "rmse": 9.49768979796923,
-    "mae": 5.210669414703504,
-    "r2": -0.11178940954469607
+    "rmse": 7.823035088386019,
+    "mae": 6.597320897457207,
+    "r2": -0.13848707337744104
   }
 }
